@@ -124,6 +124,7 @@ def _report_dict(report: Any) -> dict[str, Any]:
         "duplicates": report.duplicates,
         "late": report.late,
         "rejected": report.rejected,
+        "corrected": report.corrected,
         "watermark_ms": report.watermark_ms,
         "windows_finalized": report.windows_finalized,
         "rejected_items": [

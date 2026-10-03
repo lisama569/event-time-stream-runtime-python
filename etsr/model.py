@@ -28,7 +28,12 @@ class Event:
 
 @dataclass(frozen=True, slots=True)
 class WindowResult:
-    """一个 (key, 窗口) 的最终聚合结论（窗口关闭后不可再变）。"""
+    """一个 (key, 窗口) 的聚合结论。
+
+    窗口关闭时产出 revision=0 的初始结论；开启迟到容忍后，容忍范围内的
+    迟到事件会修正该结论（revision 递增，corrected_event_ids 记录参与修正
+    的事件位点），最终以修正后的结论为准。
+    """
 
     key: str
     window_start_ms: int
@@ -42,6 +47,8 @@ class WindowResult:
     watermark_at_close_ms: int | None = None
     checkpoint_id: int | None = None
     updated_at_checkpoints: list[int] = field(default_factory=list)
+    revision: int = 0
+    corrected_event_ids: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +64,8 @@ class WindowResult:
             "watermark_at_close_ms": self.watermark_at_close_ms,
             "checkpoint_id": self.checkpoint_id,
             "updated_at_checkpoints": list(self.updated_at_checkpoints),
+            "revision": self.revision,
+            "corrected_event_ids": list(self.corrected_event_ids),
         }
 
     @classmethod
@@ -74,12 +83,20 @@ class WindowResult:
             watermark_at_close_ms=data.get("watermark_at_close_ms"),
             checkpoint_id=data.get("checkpoint_id"),
             updated_at_checkpoints=[int(x) for x in data.get("updated_at_checkpoints", [])],
+            revision=int(data.get("revision", 0)),
+            corrected_event_ids=[int(x) for x in data.get("corrected_event_ids", [])],
         )
 
 
 @dataclass(frozen=True, slots=True)
 class LateRecord:
-    """窗口关闭后才到达的迟到事件（不静默丢弃，进入旁路输出）。"""
+    """窗口关闭后才到达、且未被迟到容忍吸收的迟到事件（不静默丢弃，进入旁路输出）。
+
+    reason 可区分：
+    - LATE_AFTER_WINDOW_CLOSE：未开启迟到容忍（默认），窗口关闭后到达；
+    - LATE_BEYOND_ALLOWED_LATENESS：开启了容忍但已超出容忍范围（或对应窗口
+      的可修正状态已随水位线推进被释放）。
+    """
 
     event_offset: int
     event_id: str | None
@@ -109,6 +126,7 @@ class IngestionReport:
     duplicates: int = 0
     late: int = 0
     rejected: int = 0
+    corrected: int = 0
     watermark_ms: int = 0
     windows_finalized: int = 0
     rejected_items: list[RejectedItem] = field(default_factory=list)

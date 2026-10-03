@@ -28,6 +28,8 @@ class Checkpoint:
     windows: dict[str, dict[str, Any]] = field(default_factory=dict)
     finalized_results: list[dict[str, Any]] = field(default_factory=list)
     duplicate_offsets: list[int] = field(default_factory=list)
+    # 已关闭但仍在迟到容忍范围内、可被修正的窗口聚合状态（有上界：随水位线推进释放）。
+    correctable_windows: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def checkpoint_to_dict(checkpoint: Checkpoint) -> dict[str, Any]:
@@ -39,6 +41,7 @@ def checkpoint_to_dict(checkpoint: Checkpoint) -> dict[str, Any]:
         "windows": checkpoint.windows,
         "finalized_results": list(checkpoint.finalized_results),
         "duplicate_offsets": list(checkpoint.duplicate_offsets),
+        "correctable_windows": checkpoint.correctable_windows,
     }
 
 
@@ -53,6 +56,8 @@ def checkpoint_from_dict(data: dict[str, Any]) -> Checkpoint:
             windows=dict(data.get("windows", {})),
             finalized_results=list(data.get("finalized_results", [])),
             duplicate_offsets=[int(x) for x in data.get("duplicate_offsets", [])],
+            # 旧版本检查点没有该字段，缺省为空（等价于未开启迟到容忍）。
+            correctable_windows=dict(data.get("correctable_windows", {})),
         )
     except CheckpointCorruptError:
         raise
