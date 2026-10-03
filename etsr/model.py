@@ -28,7 +28,11 @@ class Event:
 
 @dataclass(frozen=True, slots=True)
 class WindowResult:
-    """一个 (key, 窗口) 的最终聚合结论（窗口关闭后不可再变）。"""
+    """一个 (key, 窗口) 的聚合结论。
+
+    revision=0 为窗口关闭时的首次定稿；开启迟到容忍后，容忍范围内的迟到事件
+    会触发结论修正，revision 单调递增，以最新 revision 为最终结论。
+    """
 
     key: str
     window_start_ms: int
@@ -42,6 +46,13 @@ class WindowResult:
     watermark_at_close_ms: int | None = None
     checkpoint_id: int | None = None
     updated_at_checkpoints: list[int] = field(default_factory=list)
+    revision: int = 0
+
+    @property
+    def corrected(self) -> bool:
+        """是否经历过至少一次迟到修正。"""
+
+        return self.revision > 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +68,7 @@ class WindowResult:
             "watermark_at_close_ms": self.watermark_at_close_ms,
             "checkpoint_id": self.checkpoint_id,
             "updated_at_checkpoints": list(self.updated_at_checkpoints),
+            "revision": self.revision,
         }
 
     @classmethod
@@ -74,6 +86,46 @@ class WindowResult:
             watermark_at_close_ms=data.get("watermark_at_close_ms"),
             checkpoint_id=data.get("checkpoint_id"),
             updated_at_checkpoints=[int(x) for x in data.get("updated_at_checkpoints", [])],
+            revision=int(data.get("revision", 0)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionRecord:
+    """一次迟到修正的可解释记录：哪个窗口、第几版、修正后结论、参与事件。"""
+
+    key: str
+    window_start_ms: int
+    window_end_ms: int
+    revision: int
+    value: float
+    count: int
+    triggering_offsets: list[int] = field(default_factory=list)
+    watermark_ms: int = -1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "window_start_ms": self.window_start_ms,
+            "window_end_ms": self.window_end_ms,
+            "revision": self.revision,
+            "value": self.value,
+            "count": self.count,
+            "triggering_offsets": list(self.triggering_offsets),
+            "watermark_ms": self.watermark_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CorrectionRecord":
+        return cls(
+            key=data["key"],
+            window_start_ms=int(data["window_start_ms"]),
+            window_end_ms=int(data["window_end_ms"]),
+            revision=int(data["revision"]),
+            value=float(data["value"]),
+            count=int(data["count"]),
+            triggering_offsets=[int(x) for x in data.get("triggering_offsets", [])],
+            watermark_ms=int(data.get("watermark_ms", -1)),
         )
 
 
@@ -109,6 +161,7 @@ class IngestionReport:
     duplicates: int = 0
     late: int = 0
     rejected: int = 0
+    corrected: int = 0
     watermark_ms: int = 0
     windows_finalized: int = 0
     rejected_items: list[RejectedItem] = field(default_factory=list)

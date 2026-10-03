@@ -50,6 +50,8 @@ class WindowAggregationState:
         self.first_event_time_ms: int | None = None
         self.last_event_time_ms: int | None = None
         self.updated_at_checkpoints: list[int] = []
+        # 结论版本号：0=首次定稿；迟到容忍期内每次修正 +1。
+        self.revision = 0
 
     @property
     def count(self) -> int:
@@ -97,6 +99,7 @@ class WindowAggregationState:
             watermark_at_close_ms=int(watermark_ms) if watermark_ms is not None else None,
             checkpoint_id=checkpoint_id,
             updated_at_checkpoints=list(self.updated_at_checkpoints),
+            revision=self.revision,
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -110,6 +113,7 @@ class WindowAggregationState:
             "first_event_time_ms": self.first_event_time_ms,
             "last_event_time_ms": self.last_event_time_ms,
             "updated_at_checkpoints": list(self.updated_at_checkpoints),
+            "revision": self.revision,
         }
 
     @classmethod
@@ -126,4 +130,5 @@ class WindowAggregationState:
         win.first_event_time_ms = state.get("first_event_time_ms")
         win.last_event_time_ms = state.get("last_event_time_ms")
         win.updated_at_checkpoints = list(state.get("updated_at_checkpoints", []))
+        win.revision = int(state.get("revision", 0))
         return win

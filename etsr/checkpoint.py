@@ -19,7 +19,8 @@ class Checkpoint:
     """一次一致性快照。
 
     包含：检查点 id、下一条待处理位点 next_offset、水位线、
-    全部尚未关闭窗口的聚合状态、已输出窗口键、被识别为重复的位点。
+    全部尚未关闭窗口的聚合状态、容忍期内可修正窗口的聚合状态、
+    已输出窗口结论、迟到修正流水、被识别为重复的位点。
     """
 
     checkpoint_id: int
@@ -28,6 +29,8 @@ class Checkpoint:
     windows: dict[str, dict[str, Any]] = field(default_factory=dict)
     finalized_results: list[dict[str, Any]] = field(default_factory=list)
     duplicate_offsets: list[int] = field(default_factory=list)
+    correctable_windows: dict[str, dict[str, Any]] = field(default_factory=dict)
+    corrections: list[dict[str, Any]] = field(default_factory=list)
 
 
 def checkpoint_to_dict(checkpoint: Checkpoint) -> dict[str, Any]:
@@ -39,6 +42,8 @@ def checkpoint_to_dict(checkpoint: Checkpoint) -> dict[str, Any]:
         "windows": checkpoint.windows,
         "finalized_results": list(checkpoint.finalized_results),
         "duplicate_offsets": list(checkpoint.duplicate_offsets),
+        "correctable_windows": checkpoint.correctable_windows,
+        "corrections": list(checkpoint.corrections),
     }
 
 
@@ -53,6 +58,8 @@ def checkpoint_from_dict(data: dict[str, Any]) -> Checkpoint:
             windows=dict(data.get("windows", {})),
             finalized_results=list(data.get("finalized_results", [])),
             duplicate_offsets=[int(x) for x in data.get("duplicate_offsets", [])],
+            correctable_windows=dict(data.get("correctable_windows", {})),
+            corrections=list(data.get("corrections", [])),
         )
     except CheckpointCorruptError:
         raise

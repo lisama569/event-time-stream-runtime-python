@@ -9,6 +9,7 @@ from etsr.buffer import BoundedBuffer
 from etsr.checkpoint import Checkpoint, LocalCheckpointStore
 from etsr.errors import CheckpointRegressionError, OffsetGapError
 from etsr.model import (
+    CorrectionRecord,
     Event,
     IngestionReport,
     LateRecord,
@@ -37,6 +38,7 @@ class EngineConfig:
     auto_checkpoint_events: int = 0  # 0 表示仅在显式调用时做检查点
     process_budget_per_cycle: int = 0  # 每个处理周期最多处理事件数，0 表示不限速（全部排空）
     source_pull_per_cycle: int = 0  # 每周期从源拉取的突发大小，0 表示等于处理预算
+    allowed_lateness_ms: int = 0  # 窗口关闭后的迟到容忍时长（按事件时间所属窗口起算），0 表示不容忍（默认行为）
 
 
 class StreamRuntime:
@@ -58,6 +60,8 @@ class StreamRuntime:
         self._store = LocalCheckpointStore(self.config.state_dir)
         self._sink = ResultCollector()
         self._pending: dict[str, WindowAggregationState] = {}
+        # 已关闭但仍处于迟到容忍期内的窗口状态：可修正；容忍期一过即释放。
+        self._correctable: dict[str, WindowAggregationState] = {}
         self._next_offset = 0
         self._checkpoint_id = 0
         self._events_since_checkpoint = 0
@@ -91,6 +95,10 @@ class StreamRuntime:
             key: WindowAggregationState.restore(state)
             for key, state in cp.windows.items()
         }
+        self._correctable = {
+            key: WindowAggregationState.restore(state)
+            for key, state in cp.correctable_windows.items()
+        }
         self._watermark = WatermarkGenerator.restore(
             cp.watermark_ms, self.config.max_out_of_orderness_ms
         )
@@ -101,12 +109,16 @@ class StreamRuntime:
         # 回填崩溃前已输出窗口，保证恢复后最终结论完整且重放不重复计入。
         for result_data in cp.finalized_results:
             self._sink.restore_result(WindowResult.from_dict(result_data))
+        self._sink.restore_corrections(
+            [CorrectionRecord.from_dict(data) for data in cp.corrections]
+        )
         self._sink.restore_duplicates(cp.duplicate_offsets)
         logger.info(
             "checkpoint restored | id=%d next_offset=%d watermark_ms=%s "
-            "pending_windows=%d finalized_windows=%d",
+            "pending_windows=%d finalized_windows=%d correctable_windows=%d corrections=%d",
             cp.checkpoint_id, cp.next_offset, cp.watermark_ms,
             len(cp.windows), len(cp.finalized_results),
+            len(cp.correctable_windows), len(cp.corrections),
         )
 
     def checkpoint(self) -> Checkpoint:
@@ -120,13 +132,19 @@ class StreamRuntime:
             windows={key: win.snapshot() for key, win in self._pending.items()},
             finalized_results=[r.to_dict() for r in self._sink.results_sorted()],
             duplicate_offsets=self._sink.duplicate_offsets(),
+            correctable_windows={
+                key: win.snapshot() for key, win in self._correctable.items()
+            },
+            corrections=[r.to_dict() for r in self._sink.corrections()],
         )
         self._store.save(cp)
         self._events_since_checkpoint = 0
         logger.info(
-            "checkpoint saved | id=%d next_offset=%d watermark_ms=%s pending=%d finalized=%d",
+            "checkpoint saved | id=%d next_offset=%d watermark_ms=%s pending=%d "
+            "finalized=%d correctable=%d corrections=%d",
             cp.checkpoint_id, cp.next_offset, cp.watermark_ms,
             len(cp.windows), len(cp.finalized_results),
+            len(cp.correctable_windows), len(cp.corrections),
         )
         return cp
 
@@ -161,12 +179,13 @@ class StreamRuntime:
         else:
             limit = max_events
         items = self._buffer.drain(limit)
-        accepted = duplicates = late = 0
+        accepted = duplicates = late = corrected = 0
         for raw in items:
             outcome = self._process(raw)
             accepted += outcome["accepted"]
             duplicates += outcome["duplicates"]
             late += outcome["late"]
+            corrected += outcome["corrected"]
         finalized_now = self._close_due_windows()
         if self._auto_due():
             self.checkpoint()
@@ -174,6 +193,7 @@ class StreamRuntime:
             accepted=accepted,
             duplicates=duplicates,
             late=late,
+            corrected=corrected,
             watermark_ms=self._watermark.current_ms or 0,
             windows_finalized=finalized_now,
         )
@@ -284,17 +304,30 @@ class StreamRuntime:
         if offset < self._next_offset:
             self._sink.record_duplicate(offset)
             logger.info("duplicate event | offset=%d ignored (idempotent)", offset)
-            return {"accepted": 0, "duplicates": 1, "late": 0}
+            return {"accepted": 0, "duplicates": 1, "late": 0, "corrected": 0}
 
         start, end = self._assigner.assign(event.event_time_ms)
         wkey = _window_key(event.key, start)
         wm_before = self._watermark.current_ms
 
-        # 3) 迟到判定：水位线已越过窗口结束（或窗口早已输出）-> 旁路，不静默丢弃。
+        # 3) 迟到判定：水位线已越过窗口结束（或窗口早已输出）。
         already_closed = self._sink.contains_window(event.key, start)
         is_late_by_wm = wm_before is not None and int(event.event_time_ms) < wm_before
         if already_closed or (is_late_by_wm and wm_before is not None and wm_before >= end):
+            lateness = self.config.allowed_lateness_ms
+            # 容忍期内（watermark < window_end + allowed_lateness）：
+            # 修正该窗口已给出的结论，以修正后的结论为准。
+            if lateness > 0 and (
+                wm_before is None or wm_before < end + lateness
+            ):
+                return self._apply_correction(event, wkey, start, end, wm_before)
+            # 超出容忍范围（或未开启容忍）：旁路记录，绝不静默丢弃，也不污染结论。
             late_by = (wm_before - int(event.event_time_ms)) if wm_before is not None else 0
+            reason = (
+                "LATE_BEYOND_ALLOWED_LATENESS"
+                if lateness > 0
+                else "LATE_AFTER_WINDOW_CLOSE"
+            )
             record = LateRecord(
                 event_offset=offset,
                 event_id=event.event_id,
@@ -304,14 +337,16 @@ class StreamRuntime:
                 window_end_ms=end,
                 watermark_ms=wm_before if wm_before is not None else -1,
                 late_by_ms=max(0, late_by),
+                reason=reason,
             )
             self._sink.side_output(record)
             self._next_offset = offset + 1
             logger.info(
-                "late event | offset=%d event_time_ms=%d window=[%d,%d) watermark_ms=%s -> side-output",
-                offset, event.event_time_ms, start, end, wm_before,
+                "late event | offset=%d event_time_ms=%d window=[%d,%d) watermark_ms=%s "
+                "reason=%s -> side-output",
+                offset, event.event_time_ms, start, end, wm_before, reason,
             )
-            return {"accepted": 0, "duplicates": 0, "late": 1}
+            return {"accepted": 0, "duplicates": 0, "late": 1, "corrected": 0}
 
         # 4) 观察事件时间（单调推进），并入窗口（关闭前可更新）。
         new_wm = self._watermark.observe(int(event.event_time_ms))
@@ -328,7 +363,64 @@ class StreamRuntime:
             "event | offset=%d event_time_ms=%d key=%s value=%s window=[%d,%d) watermark_ms=%s",
             offset, event.event_time_ms, event.key, event.value, start, end, new_wm,
         )
-        return {"accepted": 1, "duplicates": 0, "late": 0}
+        return {"accepted": 1, "duplicates": 0, "late": 0, "corrected": 0}
+
+    def _apply_correction(
+        self,
+        event: Event,
+        wkey: str,
+        start: int,
+        end: int,
+        wm_before: int | None,
+    ) -> dict[str, int]:
+        """容忍期内的迟到事件：并入保留的窗口状态并输出修正后的结论。
+
+        不触碰水位线（迟到事件时间必然更旧，观察它无意义），
+        按源位点幂等去重，重放/重复投递不会把同一次修正算两遍。
+        """
+
+        offset = int(event.offset)
+        state = self._correctable.get(wkey)
+        is_first_firing = state is None
+        if is_first_firing:
+            # 窗口关闭前没有任何事件落入（如纯心跳推进水位线），
+            # 容忍期内的首条迟到事件补出该窗口的首版结论。
+            state = WindowAggregationState(
+                event.key, start, end, self.config.aggregate
+            )
+            self._correctable[wkey] = state
+        if not state.add(event, self._checkpoint_id):
+            # 该位点已计入过此窗口（异常重放路径）：幂等跳过。
+            self._sink.record_duplicate(offset)
+            self._next_offset = offset + 1
+            return {"accepted": 0, "duplicates": 1, "late": 0, "corrected": 0}
+        wm_at_fire = wm_before if wm_before is not None else 0
+        if is_first_firing:
+            result = state.finalize(wm_at_fire, self._checkpoint_id)
+            self._sink.collect(result)
+        else:
+            state.revision += 1
+            result = state.finalize(wm_at_fire, self._checkpoint_id)
+            record = CorrectionRecord(
+                key=event.key,
+                window_start_ms=start,
+                window_end_ms=end,
+                revision=state.revision,
+                value=result.value,
+                count=result.count,
+                triggering_offsets=[offset],
+                watermark_ms=wm_at_fire,
+            )
+            self._sink.apply_correction(result, record)
+        self._next_offset = offset + 1
+        self._events_since_checkpoint += 1
+        logger.info(
+            "window corrected | offset=%d event_time_ms=%d key=%s window=[%d,%d) "
+            "revision=%d value=%s count=%d watermark_ms=%s",
+            offset, event.event_time_ms, event.key, start, end,
+            result.revision, result.value, result.count, wm_before,
+        )
+        return {"accepted": 0, "duplicates": 0, "late": 0, "corrected": 1}
 
     def _close_due_windows(self) -> int:
         wm = self._watermark.current_ms
@@ -342,6 +434,9 @@ class StreamRuntime:
             result = win.finalize(wm, self._checkpoint_id)
             self._sink.collect(result)
             del self._pending[key]
+            if self.config.allowed_lateness_ms > 0:
+                # 开启迟到容忍：关闭后保留可修正状态，直至容忍期结束被释放。
+                self._correctable[key] = win
             logger.info(
                 "window closed | key=%s window=[%d,%d) aggregate=%s value=%s count=%d "
                 "watermark_ms=%d included=%s",
@@ -349,7 +444,28 @@ class StreamRuntime:
                 win.aggregate, result.value, result.count, wm,
                 result.included_event_ids,
             )
+        self._purge_expired_correctable(wm)
         return len(due)
+
+    def _purge_expired_correctable(self, wm: int) -> int:
+        """释放已超出容忍期的可修正窗口状态，保证修正状态有上界。"""
+
+        lateness = self.config.allowed_lateness_ms
+        if lateness <= 0:
+            return 0
+        expired = sorted(
+            key for key, win in self._correctable.items()
+            if win.window_end_ms + lateness <= wm
+        )
+        for key in expired:
+            win = self._correctable.pop(key)
+            logger.info(
+                "correctable window purged | key=%s window=[%d,%d) revision=%d "
+                "watermark_ms=%d allowed_lateness_ms=%d",
+                win.key, win.window_start_ms, win.window_end_ms,
+                win.revision, wm, lateness,
+            )
+        return len(expired)
 
     def _auto_due(self) -> bool:
         n = self.config.auto_checkpoint_events
@@ -362,6 +478,7 @@ class StreamRuntime:
             duplicates=total.duplicates + part.duplicates,
             late=total.late + part.late,
             rejected=total.rejected + part.rejected,
+            corrected=total.corrected + part.corrected,
             watermark_ms=part.watermark_ms or total.watermark_ms,
             windows_finalized=total.windows_finalized + part.windows_finalized,
             rejected_items=total.rejected_items + part.rejected_items,
@@ -403,6 +520,30 @@ class StreamRuntime:
     def results(self) -> list[WindowResult]:
         return self._sink.results_sorted()
 
+    def corrections(self) -> list[CorrectionRecord]:
+        """历次迟到修正流水（窗口、版本、修正后结论、参与事件位点）。"""
+
+        return self._sink.corrections()
+
+    def correctable_windows(self) -> list[dict[str, object]]:
+        """已关闭但仍在迟到容忍期内、可被修正的窗口状态（有上界，逾期即释放）。"""
+
+        return [
+            {
+                "key": win.key,
+                "window_start_ms": win.window_start_ms,
+                "window_end_ms": win.window_end_ms,
+                "aggregate": win.aggregate,
+                "value": win.preliminary_value(),
+                "count": win.count,
+                "revision": win.revision,
+                "included_event_ids": list(win.included_event_ids),
+            }
+            for win in sorted(
+                self._correctable.values(), key=lambda w: (w.window_start_ms, w.key)
+            )
+        ]
+
     def late_events(self) -> list[LateRecord]:
         return self._sink.late_events()
 
@@ -416,7 +557,10 @@ class StreamRuntime:
             "window_size_ms": self.config.window_size_ms,
             "max_out_of_orderness_ms": self.config.max_out_of_orderness_ms,
             "aggregate": self.config.aggregate,
+            "allowed_lateness_ms": self.config.allowed_lateness_ms,
             "pending_windows": self.pending_windows(),
+            "correctable_windows": self.correctable_windows(),
+            "corrections": [r.to_dict() for r in self.corrections()],
             "finalized": [
                 {
                     "key": r.key,
@@ -426,6 +570,8 @@ class StreamRuntime:
                     "included_event_ids": r.included_event_ids,
                     "watermark_at_close_ms": r.watermark_at_close_ms,
                     "checkpoint_id": r.checkpoint_id,
+                    "revision": r.revision,
+                    "corrected": r.corrected,
                 }
                 for r in self.results()
             ],

@@ -19,7 +19,7 @@ etsr/
   engine.py      运行时核心：串起水位线、窗口、检查点、背压
 main.py          FastAPI 入口（/events、/events/batch、/watermark、/checkpoint …）
 scripts/demo.py  无故障运行 vs 崩溃恢复的端到端对比演示
-tests/           21 个单测，覆盖乱序、迟到、重启重放、背压、跨入口一致性
+tests/           36 个单测，覆盖乱序、迟到、迟到容忍修正、重启重放、背压、跨入口一致性
 ```
 
 ## 时间语义（event-time，不是处理时间）
@@ -34,18 +34,42 @@ tests/           21 个单测，覆盖乱序、迟到、重启重放、背压、
   都不能拉低它（见 `test_watermark_is_monotonic_and_never_regresses`）。
 - 窗口在 `watermark >= window_end` 时关闭。**关闭前**，乱序事件可持续并入，
   `pending_windows()` / `GET /state` 能看到不断更新的中间聚合；**关闭时**产出
-  不可变的 `WindowResult`（含聚合值、计数、纳入的源位点列表、关闭时水位线、
-  经历过的检查点 id），之后从 `pending` 移除并进入最终结果。
+  `WindowResult`（含聚合值、计数、纳入的源位点列表、关闭时水位线、
+  经历过的检查点 id、结论版本 revision），之后从 `pending` 移除并进入最终结果。
+  默认配置下该结论不可再变；开启迟到容忍后，容忍期内可被修正（见下节）。
 
 ### 迟到事件：不静默丢弃，也不重复计入
 
 - 当事件到达时其窗口**已经关闭**（或 `event_time < watermark` 且水位线已越过窗口
   结束边界），判定为迟到。
-- 迟到事件**不会**改动已定稿的结果，而是进入**迟到旁路输出** `late_events()`，
-  记录事件位点、所属窗口、当时水位线、迟到毫秒数与稳定原因码
-  `LATE_AFTER_WINDOW_CLOSE`。
+- 默认（`allowed_lateness_ms=0`）时，迟到事件**不会**改动已定稿的结果，而是进入
+  **迟到旁路输出** `late_events()`，记录事件位点、所属窗口、当时水位线、迟到毫秒数
+  与稳定原因码 `LATE_AFTER_WINDOW_CLOSE`。
 - 注意区分：事件时间比当前水位线旧、但其窗口尚未关闭时，仍是**正常乱序事件**，
   会计入并更新窗口（见 `test_event_before_watermark_but_window_open_is_still_accepted`）。
+
+### 迟到容忍与结论修正（`allowed_lateness_ms > 0`，默认关闭）
+
+- 窗口关闭后，从窗口结束时间起算额外保留一段**容忍期**
+  `[window_end, window_end + allowed_lateness_ms)`（按事件的事件时间所属窗口判断）。
+- 容忍期内到达的迟到事件**修正**该窗口已给出的结论：并入保留的窗口状态，输出
+  revision 单调递增的新结论，**以最新 revision 为准**。可从多处观察到修正：
+  - `WindowResult.revision` / `corrected`：是否被修正过、当前是第几版；
+  - `corrections()` / `GET /state` 的 `corrections`：每次修正的流水（窗口、版本、
+    修正后结论、**参与本次修正的事件位点**、当时水位线）；
+  - `correctable_windows()` / `GET /state`：当前仍处于容忍期内、可被修正的窗口。
+- 超出容忍期的迟到事件仍走旁路，但原因码为 **`LATE_BEYOND_ALLOWED_LATENESS`**，
+  与未开启容忍时的 `LATE_AFTER_WINDOW_CLOSE` 明显区分；已给出的修正结论不会被
+  超容忍事件污染，也不会被静默丢弃。
+- **修正状态有上界**：水位线越过 `window_end + allowed_lateness_ms` 时，对应窗口的
+  可修正状态立即释放（日志 `correctable window purged`），历史再长也不会堆积；
+  释放之后才到的更晚数据走上面的超容忍旁路，给出明确且可区分的处理结果。
+- 修正**不触碰水位线**（迟到事件时间必然更旧），也不影响已关闭窗口的既有语义；
+  同一条事件重复投递由位点幂等去重吸收，同一次修正不会被算两遍。
+- 可修正窗口状态与修正流水**随检查点一起持久化**，崩溃重启、重放后继续修正，
+  最终结论（含 revision 与修正流水）与全程无故障运行完全一致
+  （见 `test_restart_replay_correction_matches_failure_free`）。
+- **不开启时（默认）表现与原有行为完全一致**：无修正、无可修正状态、迟到原因码不变。
 
 ## 位点、去重与状态保留
 
@@ -67,7 +91,9 @@ tests/           21 个单测，覆盖乱序、迟到、重启重放、背压、
 | `next_offset` | 下一条待处理事件的源位点（恢复后从这里重放） |
 | `watermark_ms` | 水位线，恢复后重放旧数据不会使其倒退 |
 | `windows` | 所有尚未关闭窗口的可更新聚合状态（含已纳入位点） |
-| `finalized_results` | 已关闭窗口的完整最终结果（保证恢复后结论完整） |
+| `correctable_windows` | 已关闭但仍在迟到容忍期内的可修正窗口状态（含 revision） |
+| `finalized_results` | 已关闭窗口的最新结论（含 revision，修正后以最新版为准） |
+| `corrections` | 历次迟到修正流水（窗口、版本、修正后结论、参与事件位点） |
 | `duplicate_offsets` | 已识别为重复的位点 |
 
 ## 故障恢复方式
@@ -97,8 +123,9 @@ tests/           21 个单测，覆盖乱序、迟到、重启重放、背压、
   - `ingest_batch` / `run_source` 会把装不下的**尾部事件**原样保留并在投递报告中逐条
     给出拒绝原因，`run_source` 内部按**原顺序**“处理腾空间 → 重试后缀”，既不丢数据
     也不造成位点缺口；
-- 过载（`OVERLOADED_BUFFER_FULL`）、迟到（`LATE_AFTER_WINDOW_CLOSE`）、重复
-  （计入 `duplicates`）、位点缺口（`OFFSET_GAP`）、检查点回退（`STALE_CHECKPOINT`）
+- 过载（`OVERLOADED_BUFFER_FULL`）、迟到（`LATE_AFTER_WINDOW_CLOSE` /
+  超容忍 `LATE_BEYOND_ALLOWED_LATENESS`）、重复（计入 `duplicates`）、
+  位点缺口（`OFFSET_GAP`）、检查点回退（`STALE_CHECKPOINT`）
   各自有可区分的字段或 reason 码，失败原因不会混淆。
 
 ## 验证方法
@@ -110,6 +137,7 @@ uv sync
 # 运行全部单测（-s 可查看事件时间 / 水位线 / 检查点日志）
 uv run pytest -q
 uv run pytest -s -k "restart or late or backpressure"
+uv run pytest -s tests/test_allowed_lateness.py   # 迟到容忍 + 结论修正专项
 
 # 端到端演示：无故障运行 vs 处理 5 条后崩溃、重启重放（含重复投递）
 uv run python scripts/demo.py
@@ -130,9 +158,11 @@ uv run uvicorn main:app --reload
 
 ```
 event | offset=3 event_time_ms=900 key=a window=[0,1000) watermark_ms=1500
-late event | offset=6 ... watermark_ms=2500 -> side-output
+late event | offset=6 ... watermark_ms=2500 reason=LATE_AFTER_WINDOW_CLOSE -> side-output
 window closed | key=a window=[0,1000) aggregate=SUM value=3.0 count=2 watermark_ms=3000
-checkpoint saved | id=1 next_offset=4 watermark_ms=1500 pending=2 finalized=1
+window corrected | offset=8 event_time_ms=400 key=a window=[0,1000) revision=1 value=105.0 ...
+correctable window purged | key=a window=[0,1000) revision=1 watermark_ms=1500 allowed_lateness_ms=500
+checkpoint saved | id=1 next_offset=4 watermark_ms=1500 pending=2 finalized=1 correctable=1 ...
 checkpoint restored | id=1 next_offset=4 watermark_ms=1500 pending_windows=2 ...
 backpressure | 2 events withheld, draining before retry
 ```
