@@ -26,7 +26,7 @@ def _fingerprint(rt: StreamRuntime) -> dict[str, object]:
     return {
         "results": [
             (r.key, r.window_start_ms, r.window_end_ms, r.value, r.count,
-             tuple(r.included_event_ids), r.revision)
+             tuple(r.included_event_ids), r.revision, r.watermark_at_close_ms)
             for r in rt.results()
         ],
         "corrections": [r.to_dict() for r in rt.corrections()],
@@ -79,6 +79,40 @@ def test_correction_does_not_disturb_watermark(
     wm_before = rt.watermark_ms
     rt.ingest_event(make_event(1, 200, "a", 5.0))  # 容忍期内修正
     assert rt.watermark_ms == wm_before == 1000  # 水位线不被迟到事件带乱
+
+
+def test_correction_preserves_watermark_at_close(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    """修正只改结论本身：关闭时水位线保持窗口关闭那一刻的值。"""
+
+    rt = _runtime(tmp_path, allowed_lateness_ms=500)
+    rt.ingest_event(make_event(0, 100, "a", 2.0))
+    rt.advance_watermark(1000)  # 关闭 [0,1000)，关闭时水位线 = 1000
+    assert rt.results()[0].watermark_at_close_ms == 1000
+
+    rt.advance_watermark(1300)  # 窗口关闭后水位线继续往前走
+    rt.ingest_event(make_event(1, 400, "a", 100.0))  # 容忍期内修正
+    rt.advance_watermark(1400)
+    rt.ingest_event(make_event(2, 500, "a", 20.0))  # 再次修正
+
+    final = rt.results()[0]
+    assert final.revision == 2 and final.value == 122.0
+    assert final.watermark_at_close_ms == 1000  # 不被修正时刻的水位线覆盖
+    # 修正流水里记的是各次修正发生时的水位线，与关闭时水位线是两回事。
+    assert [c.watermark_ms for c in rt.corrections()] == [1400]
+
+    # 未经历修正的窗口：关闭时水位线语义不变，两种窗口可以对比。
+    rt.ingest_event(make_event(3, 1100, "a", 7.0))
+    rt.advance_watermark(2000)  # 关闭 [1000,2000)
+    by_start = {r.window_start_ms: r for r in rt.results()}
+    assert by_start[1000].watermark_at_close_ms == 2000
+    assert by_start[0].watermark_at_close_ms == 1000
+    logger.info(
+        "close watermark preserved | window=[0,1000) revision=%d "
+        "watermark_at_close_ms=%s current_watermark_ms=%s",
+        final.revision, final.watermark_at_close_ms, rt.watermark_ms,
+    )
 
 
 def test_tolerance_boundary_exactly_within_and_exactly_beyond(
@@ -151,6 +185,61 @@ def test_correctable_state_is_released_after_tolerance(
     logger.info(
         "state bounded | max_correctable=%d finalized=%d watermark_ms=%s",
         max_correctable, len(rt.results()), rt.watermark_ms,
+    )
+
+
+def test_correction_state_does_not_grow_with_late_volume(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    """长跑 + 持续迟到修正：修正相关状态不随迟到数据量线性膨胀。
+
+    - 可修正状态：任一时刻只有容忍期内的窗口（有界）；
+    - 修正审计：按窗口汇总，每个被修正窗口恒为一条，与修正次数无关；
+    - 检查点：correctable_windows / corrections 两段不随修正次数膨胀；
+    - 被修正过、修正后的值、参与事件，始终可查。
+    """
+
+    rt = _runtime(tmp_path, allowed_lateness_ms=500)
+    offset = 0
+    n_windows = 60
+    corrections_per_window = 5
+    max_correctable = 0
+    for w in range(n_windows):
+        rt.ingest_event(make_event(offset, w * 1000 + 100, "a", 1.0))
+        offset += 1
+        rt.advance_watermark((w + 1) * 1000)  # 关闭窗口 w
+        for k in range(corrections_per_window):  # 容忍期内多次修正
+            rt.ingest_event(make_event(offset, w * 1000 + 200 + k, "a", 1.0))
+            offset += 1
+        max_correctable = max(max_correctable, len(rt.correctable_windows()))
+    total_corrections = n_windows * corrections_per_window
+
+    # 可修正状态有界：容忍 500ms < 窗口 1000ms，任一时刻至多 1 个。
+    assert max_correctable <= 1
+    # 修正审计按窗口汇总：300 次修正 -> 60 条摘要（每窗口一条）。
+    summaries = rt.corrections()
+    assert len(summaries) == n_windows
+    assert len(summaries) < total_corrections
+    sample = summaries[0]
+    assert sample.revision == corrections_per_window  # 被修正过、第几版
+    assert sample.value == 1.0 + corrections_per_window  # 修正后的值
+    # 参与历次修正的事件位点完整可查（每窗口 5 个修正位点）。
+    assert len(sample.triggering_offsets) == corrections_per_window
+
+    # 检查点里修正相关两段同样有界/按窗口计。
+    cp = rt.checkpoint()
+    assert len(cp.correctable_windows) <= 1
+    assert len(cp.corrections) == n_windows
+    rt.advance_watermark((n_windows + 1) * 1000)  # 越过全部容忍期
+    assert rt.correctable_windows() == []
+    cp2 = rt.checkpoint()
+    assert len(cp2.correctable_windows) == 0  # 状态全部释放
+    assert len(cp2.corrections) == n_windows  # 审计信息不丢
+    logger.info(
+        "correction state bounded | windows=%d corrections=%d summaries=%d "
+        "max_correctable=%d checkpoint_id=%d",
+        n_windows, total_corrections, len(summaries), max_correctable,
+        cp2.checkpoint_id,
     )
 
 
@@ -280,4 +369,41 @@ def test_http_entry_sees_same_corrections_as_api(
     logger.info(
         "http/api consistent | revision=%d value=%s watermark_ms=%s",
         finalized["revision"], finalized["value"], state["watermark_ms"],
+    )
+
+
+def test_http_close_watermark_preserved_after_correction(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    """HTTP 入口看到的关闭时水位线同样不被修正改写，与直接调用一致。"""
+
+    config = EngineConfig(
+        window_size_ms=1000,
+        allowed_lateness_ms=500,
+        state_dir=str(tmp_path / "http_wm"),  # type: ignore[operator]
+    )
+    with TestClient(create_app(config=config)) as client:
+        client.post("/events", json={"offset": 0, "event_time_ms": 100, "key": "a", "value": 2})
+        client.post("/watermark", json={"watermark_ms": 1000})  # 关闭 [0,1000)
+        client.post("/watermark", json={"watermark_ms": 1300})  # 水位线继续走
+        client.post(
+            "/events", json={"offset": 1, "event_time_ms": 400, "key": "a", "value": 100}
+        )
+        state = client.get("/state").json()
+
+    finalized = state["finalized"][0]
+    assert finalized["revision"] == 1
+    assert finalized["watermark_at_close_ms"] == 1000  # 保持关闭那一刻的值
+    assert state["watermark_ms"] == 1300  # 当前水位线不受修正影响
+
+    # 同样的序列走直接 API，结论逐字段一致。
+    api = _runtime(tmp_path, "api_wm", allowed_lateness_ms=500)
+    api.ingest_event(make_event(0, 100, "a", 2.0))
+    api.advance_watermark(1000)
+    api.advance_watermark(1300)
+    api.ingest_event(make_event(1, 400, "a", 100.0))
+    assert finalized["watermark_at_close_ms"] == api.results()[0].watermark_at_close_ms
+    logger.info(
+        "http close watermark preserved | watermark_at_close_ms=%s current_wm=%s",
+        finalized["watermark_at_close_ms"], state["watermark_ms"],
     )

@@ -396,11 +396,19 @@ class StreamRuntime:
             return {"accepted": 0, "duplicates": 1, "late": 0, "corrected": 0}
         wm_at_fire = wm_before if wm_before is not None else 0
         if is_first_firing:
+            # 首版结论在此刻产出，此刻水位线即为该窗口的关闭时水位线。
+            state.closed_watermark_ms = wm_at_fire
             result = state.finalize(wm_at_fire, self._checkpoint_id)
             self._sink.collect(result)
         else:
             state.revision += 1
-            result = state.finalize(wm_at_fire, self._checkpoint_id)
+            # 修正只改结论本身：关闭时水位线保持窗口关闭那一刻的值。
+            close_wm = (
+                state.closed_watermark_ms
+                if state.closed_watermark_ms is not None
+                else wm_at_fire
+            )
+            result = state.finalize(close_wm, self._checkpoint_id)
             record = CorrectionRecord(
                 key=event.key,
                 window_start_ms=start,
@@ -431,6 +439,8 @@ class StreamRuntime:
             if win.window_end_ms <= wm
         )
         for key, win in due:
+            # 定格关闭那一刻的水位线：之后的迟到修正只改结论，不改写它。
+            win.closed_watermark_ms = wm
             result = win.finalize(wm, self._checkpoint_id)
             self._sink.collect(result)
             del self._pending[key]

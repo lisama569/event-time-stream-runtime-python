@@ -52,6 +52,8 @@ class WindowAggregationState:
         self.updated_at_checkpoints: list[int] = []
         # 结论版本号：0=首次定稿；迟到容忍期内每次修正 +1。
         self.revision = 0
+        # 窗口关闭那一刻的水位线：关闭时定格，之后的迟到修正不得改写。
+        self.closed_watermark_ms: int | None = None
 
     @property
     def count(self) -> int:
@@ -114,6 +116,7 @@ class WindowAggregationState:
             "last_event_time_ms": self.last_event_time_ms,
             "updated_at_checkpoints": list(self.updated_at_checkpoints),
             "revision": self.revision,
+            "closed_watermark_ms": self.closed_watermark_ms,
         }
 
     @classmethod
@@ -131,4 +134,6 @@ class WindowAggregationState:
         win.last_event_time_ms = state.get("last_event_time_ms")
         win.updated_at_checkpoints = list(state.get("updated_at_checkpoints", []))
         win.revision = int(state.get("revision", 0))
+        closed_wm = state.get("closed_watermark_ms")
+        win.closed_watermark_ms = int(closed_wm) if closed_wm is not None else None
         return win

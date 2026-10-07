@@ -19,7 +19,7 @@ etsr/
   engine.py      运行时核心：串起水位线、窗口、检查点、背压
 main.py          FastAPI 入口（/events、/events/batch、/watermark、/checkpoint …）
 scripts/demo.py  无故障运行 vs 崩溃恢复的端到端对比演示
-tests/           36 个单测，覆盖乱序、迟到、迟到容忍修正、重启重放、背压、跨入口一致性
+tests/           39 个单测，覆盖乱序、迟到、迟到容忍修正、重启重放、背压、跨入口一致性
 ```
 
 ## 时间语义（event-time，不是处理时间）
@@ -55,8 +55,9 @@ tests/           36 个单测，覆盖乱序、迟到、迟到容忍修正、重
 - 容忍期内到达的迟到事件**修正**该窗口已给出的结论：并入保留的窗口状态，输出
   revision 单调递增的新结论，**以最新 revision 为准**。可从多处观察到修正：
   - `WindowResult.revision` / `corrected`：是否被修正过、当前是第几版；
-  - `corrections()` / `GET /state` 的 `corrections`：每次修正的流水（窗口、版本、
-    修正后结论、**参与本次修正的事件位点**、当时水位线）；
+  - `corrections()` / `GET /state` 的 `corrections`：修正审计，**按窗口汇总**
+    （每个被修正窗口一条：当前版本、修正后结论、**参与历次修正的事件位点**、
+    最近一次修正时的水位线）；
   - `correctable_windows()` / `GET /state`：当前仍处于容忍期内、可被修正的窗口。
 - 超出容忍期的迟到事件仍走旁路，但原因码为 **`LATE_BEYOND_ALLOWED_LATENESS`**，
   与未开启容忍时的 `LATE_AFTER_WINDOW_CLOSE` 明显区分；已给出的修正结论不会被
@@ -64,7 +65,14 @@ tests/           36 个单测，覆盖乱序、迟到、迟到容忍修正、重
 - **修正状态有上界**：水位线越过 `window_end + allowed_lateness_ms` 时，对应窗口的
   可修正状态立即释放（日志 `correctable window purged`），历史再长也不会堆积；
   释放之后才到的更晚数据走上面的超容忍旁路，给出明确且可区分的处理结果。
-- 修正**不触碰水位线**（迟到事件时间必然更旧），也不影响已关闭窗口的既有语义；
+  同时修正审计**按窗口汇总**而非逐次堆记录：同一窗口的多次修正合并为一条
+  （版本/结论取最新、参与事件位点累积），内存与检查点中修正相关部分的体积与
+  "被修正的窗口数"成正比，与"迟到修正次数"无关——长跑和持续灌迟到数据下
+  不会线性膨胀。被修正过、修正后的值、哪些事件参与了修正，始终可查。
+- 修正**不触碰水位线**（迟到事件时间必然更旧），也**不改写窗口关闭时的既有语义**：
+  `watermark_at_close_ms` 在窗口关闭那一刻定格，之后无论修正多少次、修正时
+  水位线走到哪，都保持关闭那一刻的值（修正流水里的 `watermark_ms` 记的是各次
+  修正发生时的水位线，两者是不同概念）；直接调用与 HTTP `/state` 看到的一致。
   同一条事件重复投递由位点幂等去重吸收，同一次修正不会被算两遍。
 - 可修正窗口状态与修正流水**随检查点一起持久化**，崩溃重启、重放后继续修正，
   最终结论（含 revision 与修正流水）与全程无故障运行完全一致
@@ -91,9 +99,9 @@ tests/           36 个单测，覆盖乱序、迟到、迟到容忍修正、重
 | `next_offset` | 下一条待处理事件的源位点（恢复后从这里重放） |
 | `watermark_ms` | 水位线，恢复后重放旧数据不会使其倒退 |
 | `windows` | 所有尚未关闭窗口的可更新聚合状态（含已纳入位点） |
-| `correctable_windows` | 已关闭但仍在迟到容忍期内的可修正窗口状态（含 revision） |
+| `correctable_windows` | 已关闭但仍在迟到容忍期内的可修正窗口状态（含 revision），逾期即释放，有界 |
 | `finalized_results` | 已关闭窗口的最新结论（含 revision，修正后以最新版为准） |
-| `corrections` | 历次迟到修正流水（窗口、版本、修正后结论、参与事件位点） |
+| `corrections` | 迟到修正审计（按窗口汇总：版本、修正后结论、参与事件位点），不随修正次数膨胀 |
 | `duplicate_offsets` | 已识别为重复的位点 |
 
 ## 故障恢复方式
@@ -138,6 +146,10 @@ uv sync
 uv run pytest -q
 uv run pytest -s -k "restart or late or backpressure"
 uv run pytest -s tests/test_allowed_lateness.py   # 迟到容忍 + 结论修正专项
+# 其中有界性 / 关闭时水位线专项：
+#   test_correction_state_does_not_grow_with_late_volume  长跑+持续迟到下状态不膨胀
+#   test_correctable_state_is_released_after_tolerance    容忍期一过状态即释放
+#   test_correction_preserves_watermark_at_close          修正不改写关闭时水位线
 
 # 端到端演示：无故障运行 vs 处理 5 条后崩溃、重启重放（含重复投递）
 uv run python scripts/demo.py
