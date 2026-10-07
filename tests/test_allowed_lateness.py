@@ -26,7 +26,7 @@ def _fingerprint(rt: StreamRuntime) -> dict[str, object]:
     return {
         "results": [
             (r.key, r.window_start_ms, r.window_end_ms, r.value, r.count,
-             tuple(r.included_event_ids), r.revision)
+             tuple(r.included_event_ids), r.revision, r.watermark_at_close_ms)
             for r in rt.results()
         ],
         "corrections": [r.to_dict() for r in rt.corrections()],

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from etsr.buffer import BoundedBuffer
 from etsr.checkpoint import Checkpoint, LocalCheckpointStore
 from etsr.errors import CheckpointRegressionError, OffsetGapError
+from etsr.history import HistoryArchive
 from etsr.model import (
     CorrectionRecord,
     Event,
@@ -58,7 +59,8 @@ class StreamRuntime:
         self._watermark = WatermarkGenerator(self.config.max_out_of_orderness_ms)
         self._buffer = BoundedBuffer(self.config.buffer_capacity)
         self._store = LocalCheckpointStore(self.config.state_dir)
-        self._sink = ResultCollector()
+        self._archive = HistoryArchive(self.config.state_dir)
+        self._sink = ResultCollector(self._archive)
         self._pending: dict[str, WindowAggregationState] = {}
         # 已关闭但仍处于迟到容忍期内的窗口状态：可修正；容忍期一过即释放。
         self._correctable: dict[str, WindowAggregationState] = {}
@@ -99,13 +101,25 @@ class StreamRuntime:
             key: WindowAggregationState.restore(state)
             for key, state in cp.correctable_windows.items()
         }
+        # 兼容旧格式检查点：可修正状态缺少关闭时水位线时，用已输出结论回填，
+        # 保证后续修正不会改写 watermark_at_close_ms。
+        close_wm = {
+            (str(r["key"]), int(r["window_start_ms"])): r.get("watermark_at_close_ms")
+            for r in cp.finalized_results
+        }
+        for win in self._correctable.values():
+            if win.closed_watermark_ms is None:
+                value = close_wm.get((win.key, win.window_start_ms))
+                win.closed_watermark_ms = int(value) if value is not None else None
         self._watermark = WatermarkGenerator.restore(
             cp.watermark_ms, self.config.max_out_of_orderness_ms
         )
         self._next_offset = int(cp.next_offset)
         self._checkpoint_id = int(cp.checkpoint_id)
         self._events_since_checkpoint = 0
-        self._sink = ResultCollector()
+        # 归档文件在 state_dir 下持续存在，新收集器继续共用同一归档：
+        # 已封存历史不随恢复重新进入活动内存，查询时按需合并。
+        self._sink = ResultCollector(self._archive)
         # 回填崩溃前已输出窗口，保证恢复后最终结论完整且重放不重复计入。
         for result_data in cp.finalized_results:
             self._sink.restore_result(WindowResult.from_dict(result_data))
@@ -122,7 +136,11 @@ class StreamRuntime:
         )
 
     def checkpoint(self) -> Checkpoint:
-        """对 (位点, 水位线, 全部窗口状态) 做一致性快照并原子落盘。"""
+        """对 (位点, 水位线, 活动窗口状态) 做一致性快照并原子落盘。
+
+        只携带活动状态：未关闭窗口 + 仍在容忍期内的可修正窗口及其结论/修正流水。
+        已过容忍期的窗口历史已封存进归档，不进检查点，文件体积不随历史增长。
+        """
 
         self._checkpoint_id += 1
         cp = Checkpoint(
@@ -130,12 +148,12 @@ class StreamRuntime:
             next_offset=self._next_offset,
             watermark_ms=self._watermark.current_ms,
             windows={key: win.snapshot() for key, win in self._pending.items()},
-            finalized_results=[r.to_dict() for r in self._sink.results_sorted()],
+            finalized_results=[r.to_dict() for r in self._sink.live_results()],
             duplicate_offsets=self._sink.duplicate_offsets(),
             correctable_windows={
                 key: win.snapshot() for key, win in self._correctable.items()
             },
-            corrections=[r.to_dict() for r in self._sink.corrections()],
+            corrections=[r.to_dict() for r in self._sink.live_corrections()],
         )
         self._store.save(cp)
         self._events_since_checkpoint = 0
@@ -448,7 +466,12 @@ class StreamRuntime:
         return len(due)
 
     def _purge_expired_correctable(self, wm: int) -> int:
-        """释放已超出容忍期的可修正窗口状态，保证修正状态有上界。"""
+        """释放已超出容忍期的可修正窗口状态，保证修正状态有上界。
+
+        释放的同时把该窗口的最终结论与修正流水封存进历史归档：
+        活动内存与检查点都不再携带它，但"哪个窗口被修正过、修正后的值、
+        参与事件"仍可随时查询；之后才到的更晚数据走超容忍旁路，不影响结论。
+        """
 
         lateness = self.config.allowed_lateness_ms
         if lateness <= 0:
@@ -459,11 +482,14 @@ class StreamRuntime:
         )
         for key in expired:
             win = self._correctable.pop(key)
+            sealed = self._sink.seal_window(
+                win.key, win.window_start_ms, win.window_end_ms
+            )
             logger.info(
                 "correctable window purged | key=%s window=[%d,%d) revision=%d "
-                "watermark_ms=%d allowed_lateness_ms=%d",
+                "watermark_ms=%d allowed_lateness_ms=%d sealed=%s",
                 win.key, win.window_start_ms, win.window_end_ms,
-                win.revision, wm, lateness,
+                win.revision, wm, lateness, sealed,
             )
         return len(expired)
 

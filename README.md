@@ -14,12 +14,13 @@ etsr/
   windows.py     滚动窗口分配器 + 可更新的窗口聚合状态（含快照/恢复）
   buffer.py      有界 FIFO 缓冲，容量受限，过载抛 OVERLOADED_BUFFER_FULL
   source.py      本地事件源：连续位点、乱序追加、重放视图
-  sink.py        结果收集器：最终结果 / 迟到旁路 / 重复位点
+  sink.py        结果收集器：最终结果 / 修正流水 / 迟到旁路 / 重复位点（含封存）
+  history.py     封存历史归档 history.jsonl：追加式、崩溃容错、读取去重
   checkpoint.py  检查点原子持久化（JSON）、单调 id、损坏与回退检测
   engine.py      运行时核心：串起水位线、窗口、检查点、背压
 main.py          FastAPI 入口（/events、/events/batch、/watermark、/checkpoint …）
 scripts/demo.py  无故障运行 vs 崩溃恢复的端到端对比演示
-tests/           36 个单测，覆盖乱序、迟到、迟到容忍修正、重启重放、背压、跨入口一致性
+tests/           40 个单测，覆盖乱序、迟到、迟到容忍修正、状态有界、重启重放、背压、跨入口一致性
 ```
 
 ## 时间语义（event-time，不是处理时间）
@@ -61,15 +62,29 @@ tests/           36 个单测，覆盖乱序、迟到、迟到容忍修正、重
 - 超出容忍期的迟到事件仍走旁路，但原因码为 **`LATE_BEYOND_ALLOWED_LATENESS`**，
   与未开启容忍时的 `LATE_AFTER_WINDOW_CLOSE` 明显区分；已给出的修正结论不会被
   超容忍事件污染，也不会被静默丢弃。
-- **修正状态有上界**：水位线越过 `window_end + allowed_lateness_ms` 时，对应窗口的
-  可修正状态立即释放（日志 `correctable window purged`），历史再长也不会堆积；
-  释放之后才到的更晚数据走上面的超容忍旁路，给出明确且可区分的处理结果。
+- **修正状态有上界、检查点体积收敛**：水位线越过 `window_end + allowed_lateness_ms`
+  时，对应窗口的可修正状态立即释放（日志 `correctable window purged ... sealed=True`），
+  同时把该窗口的**最终结论与修正流水封存进追加式归档 `history.jsonl`**（state_dir 下，
+  追加 + fsync，崩溃时最后一行残缺会被容忍忽略）。此后：
+  - 活动内存与每次检查点**只携带仍在容忍期内的窗口**，长时间运行、迟到数据再多，
+    检查点文件也收敛到恒定大小，历史不再线性堆积
+    （见 `test_checkpoint_and_memory_stay_bounded_over_long_run`）；
+  - 被封存窗口的"是否被修正过、修正后的值、哪些事件参与了修正"依然随时可查：
+    `results()` / `corrections()` / `GET /state` 会自动合并归档视图，历史信息不丢；
+  - 释放之后才到的更晚数据走上面的超容忍旁路，给出明确且可区分的处理结果，
+    既不静默丢弃，也不影响已经给出的结论。
+- **修正不改写窗口关闭时的既有语义**：`watermark_at_close_ms` 在窗口关闭那一刻锁定，
+  之后无论水位线走多远、经历多少次修正、甚至崩溃重启，都保持关闭那一刻的值；
+  修正只更新结论本身（值/计数/纳入事件/revision）。直接调用与 `GET /state`
+  看到的完全一致（见 `test_correction_never_rewrites_watermark_at_close`）。
 - 修正**不触碰水位线**（迟到事件时间必然更旧），也不影响已关闭窗口的既有语义；
   同一条事件重复投递由位点幂等去重吸收，同一次修正不会被算两遍。
-- 可修正窗口状态与修正流水**随检查点一起持久化**，崩溃重启、重放后继续修正，
-  最终结论（含 revision 与修正流水）与全程无故障运行完全一致
-  （见 `test_restart_replay_correction_matches_failure_free`）。
-- **不开启时（默认）表现与原有行为完全一致**：无修正、无可修正状态、迟到原因码不变。
+- 可修正窗口状态与修正流水**随检查点一起持久化**（已封存部分由归档承载），崩溃重启、
+  重放后继续修正，最终结论（含 revision、修正流水、关闭时水位线）与全程无故障运行
+  完全一致（见 `test_restart_replay_correction_matches_failure_free` 与
+  `test_crash_restart_with_duplicates_matches_failure_free_after_sealing`）。
+- **不开启时（默认）表现与原有行为完全一致**：无修正、无可修正状态、无封存、
+  迟到原因码不变。
 
 ## 位点、去重与状态保留
 
@@ -82,8 +97,10 @@ tests/           36 个单测，覆盖乱序、迟到、迟到容忍修正、重
 
 ### 检查点内容
 
-一次 `Checkpoint` 是 `(位点, 水位线, 全部待关闭窗口状态, 已定稿窗口结果, 重复位点)`
-的一致性快照：
+一次 `Checkpoint` 是 `(位点, 水位线, 活动窗口状态)` 的一致性快照。**只含活动状态**：
+未关闭窗口 + 仍在容忍期内的可修正窗口及其结论/修正流水；已越过容忍期的窗口历史
+在释放时封存进 `history.jsonl` 归档，不再随每次检查点重复落盘，因此检查点文件
+体积有上界、不随历史增长。恢复时归档仍在 state_dir 下，查询视图自动合并两者。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -91,10 +108,14 @@ tests/           36 个单测，覆盖乱序、迟到、迟到容忍修正、重
 | `next_offset` | 下一条待处理事件的源位点（恢复后从这里重放） |
 | `watermark_ms` | 水位线，恢复后重放旧数据不会使其倒退 |
 | `windows` | 所有尚未关闭窗口的可更新聚合状态（含已纳入位点） |
-| `correctable_windows` | 已关闭但仍在迟到容忍期内的可修正窗口状态（含 revision） |
-| `finalized_results` | 已关闭窗口的最新结论（含 revision，修正后以最新版为准） |
-| `corrections` | 历次迟到修正流水（窗口、版本、修正后结论、参与事件位点） |
+| `correctable_windows` | 已关闭但仍在迟到容忍期内的可修正窗口状态（含 revision、关闭时水位线） |
+| `finalized_results` | 仍在容忍期内窗口的最新结论（含 revision，修正后以最新版为准） |
+| `corrections` | 仍在容忍期内窗口的迟到修正流水（窗口、版本、修正后结论、参与事件位点） |
 | `duplicate_offsets` | 已识别为重复的位点 |
+
+归档 `history.jsonl`（仅 `allowed_lateness_ms > 0` 时产生）：每行一条封存记录
+（窗口结论或修正流水），只追加不重写；崩溃重放可能让同一窗口被重复封存，
+读取时按窗口/版本去重（取最高 revision），保证重启后看到的结论与无故障运行一致。
 
 ## 故障恢复方式
 
@@ -138,6 +159,7 @@ uv sync
 uv run pytest -q
 uv run pytest -s -k "restart or late or backpressure"
 uv run pytest -s tests/test_allowed_lateness.py   # 迟到容忍 + 结论修正专项
+uv run pytest -s tests/test_state_boundedness.py  # 状态有界/检查点收敛/关闭时水位线专项
 
 # 端到端演示：无故障运行 vs 处理 5 条后崩溃、重启重放（含重复投递）
 uv run python scripts/demo.py
@@ -161,8 +183,36 @@ event | offset=3 event_time_ms=900 key=a window=[0,1000) watermark_ms=1500
 late event | offset=6 ... watermark_ms=2500 reason=LATE_AFTER_WINDOW_CLOSE -> side-output
 window closed | key=a window=[0,1000) aggregate=SUM value=3.0 count=2 watermark_ms=3000
 window corrected | offset=8 event_time_ms=400 key=a window=[0,1000) revision=1 value=105.0 ...
-correctable window purged | key=a window=[0,1000) revision=1 watermark_ms=1500 allowed_lateness_ms=500
+correctable window purged | key=a window=[0,1000) revision=1 watermark_ms=1500 allowed_lateness_ms=500 sealed=True
 checkpoint saved | id=1 next_offset=4 watermark_ms=1500 pending=2 finalized=1 correctable=1 ...
 checkpoint restored | id=1 next_offset=4 watermark_ms=1500 pending_windows=2 ...
 backpressure | 2 events withheld, draining before retry
+```
+
+### 本地验证"状态有界 / 关闭时水位线稳定"
+
+```bash
+# 长运行 + 每窗口都修正：观察检查点文件收敛、history.jsonl 承担历史
+uv run python - <<'EOF'
+import os, tempfile
+from etsr.engine import EngineConfig, StreamRuntime
+from etsr.model import Event
+
+tmp = tempfile.mkdtemp()
+rt = StreamRuntime(EngineConfig(window_size_ms=1000, allowed_lateness_ms=500, state_dir=tmp))
+rt.start()
+off = 0
+for i in range(30):
+    rt.ingest_event(Event(off, i * 1000 + 100, "a", 1.0)); off += 1
+    rt.advance_watermark((i + 1) * 1000)
+    rt.ingest_event(Event(off, i * 1000 + 200, "a", 1.0)); off += 1  # 容忍期内修正
+    cp = rt.checkpoint()
+    size = os.path.getsize(os.path.join(tmp, f"checkpoint-{cp.checkpoint_id:010d}.json"))
+    if i in (0, 1, 28, 29):
+        print(f"cp={cp.checkpoint_id} bytes={size} correctable={len(rt.correctable_windows())}")
+print("results:", len(rt.results()), "corrections:", len(rt.corrections()))  # 历史完整可查
+print("watermark_at_close of window 0:", rt.results()[0].watermark_at_close_ms)  # 恒为 1000
+EOF
+# 预期：检查点字节数很快收敛到恒定值；results/corrections 始终为 30；
+# 窗口 0 的 watermark_at_close_ms 恒为关闭那一刻的 1000。
 ```

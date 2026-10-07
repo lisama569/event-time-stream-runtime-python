@@ -52,6 +52,8 @@ class WindowAggregationState:
         self.updated_at_checkpoints: list[int] = []
         # 结论版本号：0=首次定稿；迟到容忍期内每次修正 +1。
         self.revision = 0
+        # 窗口关闭那一刻的水位线：首次定稿时锁定，之后的迟到修正绝不改写。
+        self.closed_watermark_ms: int | None = None
 
     @property
     def count(self) -> int:
@@ -84,8 +86,14 @@ class WindowAggregationState:
         return aggregate_value(self.aggregate, self._acc)
 
     def finalize(self, watermark_ms: int, checkpoint_id: int | None) -> WindowResult:
-        """窗口关闭，产出不可变的最终聚合结论。"""
+        """窗口关闭，产出不可变的最终聚合结论。
 
+        关闭时水位线在首次定稿时锁定：容忍期内的迟到修正只更新结论本身
+        （值/计数/纳入事件/revision），watermark_at_close_ms 恒为关闭那一刻的值。
+        """
+
+        if self.closed_watermark_ms is None and watermark_ms is not None:
+            self.closed_watermark_ms = int(watermark_ms)
         return WindowResult(
             key=self.key,
             window_start_ms=self.window_start_ms,
@@ -96,7 +104,7 @@ class WindowAggregationState:
             included_event_ids=list(self.included_event_ids),
             first_event_time_ms=self.first_event_time_ms,
             last_event_time_ms=self.last_event_time_ms,
-            watermark_at_close_ms=int(watermark_ms) if watermark_ms is not None else None,
+            watermark_at_close_ms=self.closed_watermark_ms,
             checkpoint_id=checkpoint_id,
             updated_at_checkpoints=list(self.updated_at_checkpoints),
             revision=self.revision,
@@ -114,6 +122,7 @@ class WindowAggregationState:
             "last_event_time_ms": self.last_event_time_ms,
             "updated_at_checkpoints": list(self.updated_at_checkpoints),
             "revision": self.revision,
+            "closed_watermark_ms": self.closed_watermark_ms,
         }
 
     @classmethod
@@ -131,4 +140,6 @@ class WindowAggregationState:
         win.last_event_time_ms = state.get("last_event_time_ms")
         win.updated_at_checkpoints = list(state.get("updated_at_checkpoints", []))
         win.revision = int(state.get("revision", 0))
+        closed_wm = state.get("closed_watermark_ms")
+        win.closed_watermark_ms = int(closed_wm) if closed_wm is not None else None
         return win

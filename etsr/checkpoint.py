@@ -16,11 +16,15 @@ CHECKPOINT_FORMAT_VERSION = 1
 
 @dataclass(frozen=True, slots=True)
 class Checkpoint:
-    """一次一致性快照。
+    """一次一致性快照（只含活动状态，体积有上界）。
 
     包含：检查点 id、下一条待处理位点 next_offset、水位线、
     全部尚未关闭窗口的聚合状态、容忍期内可修正窗口的聚合状态、
-    已输出窗口结论、迟到修正流水、被识别为重复的位点。
+    仍在容忍期内窗口的结论与修正流水、被识别为重复的位点。
+
+    已彻底越过容忍期的窗口历史（结论 + 修正流水）在释放时封存进
+    history.jsonl 归档（见 etsr/history.py），不再随每次检查点重复落盘；
+    恢复时归档仍在 state_dir 下，查询视图会把两者合并，历史不丢。
     """
 
     checkpoint_id: int
